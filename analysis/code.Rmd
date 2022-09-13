@@ -1,0 +1,2114 @@
+Load original data.
+
+```{r, warning=FALSE}
+
+library(readxl)
+library(tidyverse)
+
+cpr <- readxl::read_excel(path="chestPainRegistry/data.xlsx",
+                          na=c("9", "999", "9999", "6666")) |> 
+  dplyr::rename_all(tolower)
+```
+
+Select patients with acs, and variables of interest. Create a variable to split cohort into train and test subgroups.
+
+```{r, warning=FALSE}
+
+acs <- cpr |> 
+  filter(!(is.na(`ficha resca`))) |> 
+  mutate_if(is.character, as.double) |> 
+  transmute(mace = ifelse(obitot == 1 | iamcsst == 1 | iamssst == 1, 1, 0),
+            majorBleeding = sangmaior,
+            age = idade,
+            maleSex = sexo,
+            bmi = peso / alt^2,
+            currentSmoker = taba,
+            dyslipidemia = disl,
+            diabetesMellitus = dm,
+            hypertension = has,
+            kidneyDisease = irc,
+            peripheralDisease = dapp,
+            carotidDisease = carotidap,
+            coronaryDisease = dacp...27,
+            familyHistory = hfdac,
+            priorMi = iamp,
+            priorStroke = avcp,
+            priorAspirin = aasp,
+            pulse = fc,
+            systolicBp = pas,
+            killip = ifelse(killip != 1, 1, 0),
+            ecgChanges = ifelse(ecgisq == 1, 1, 0),
+            myocardialInjury = tnalta,
+            ntProBnp = probnp,
+            creatinine = creata,
+            hemoglobin = hb1)
+```
+
+Label variables.
+
+```{r, warning=FALSE}
+
+varLabels <- c("Eventos cardiovasculares adversos graves",
+               "Sangramento grave",
+               "Idade (anos)",
+               "Sexo masculino",
+               "Indice de massa corporal",
+               "Tabagismo atual",
+               "Dislipidemia",
+               "Diabetes mellitus",
+               "Hipertensão arterial sistêmica",
+               "Doença renal crônica",
+               "Doença arterial periférica",
+               "Doença arterial carotídea",
+               "Doença arterial coronariana",
+               "História familiar de DAC prematura",
+               "Infarto prévio",
+               "Acidente vascular encefálico prévio",
+               "Uso prévio de AAS",
+               "Frequência cardíaca (min⁻¹)",
+               "Pressão arterial sistólica (mmHg)",
+               "Classe de Killip II-IV",
+               "Alterações isquêmicas no ECG",
+               "Injúria miocárdica",
+               "NT pró-BNP (pg.mL⁻¹)",
+               "Creatinina (mg.dL⁻¹)",
+               "Hemoglobina (g.dL⁻¹)")
+
+library(labelled)
+var_label(acs) <- varLabels
+
+# Create variable to split into train and test subgroups
+set.seed(1)
+acs$trainSet <- ifelse(runif(nrow(acs)) < 0.8, TRUE, FALSE)
+```
+
+Describe baseline characteristics, comparing train and test subgroups.
+
+```{r, warning=FALSE}
+
+library(gt)
+library(gtsummary)
+
+theme_gtsummary_language(language = "pt",
+                         decimal.mark = ",",
+                         big.mark = ".",
+                         iqr.sep = "–")
+
+baselineChars <- acs |> 
+  select(-c(mace, majorBleeding)) |> 
+  gtsummary::tbl_summary(by = trainSet,
+                         missing="no",
+                         statistic=list(all_categorical()~"{n}/{N} ({p}%)",
+                                        all_continuous()~"{mean} ± {sd}",
+                                        c("ntProBnp", "creatinine")~
+                                          "{median} ({p25}-{p75})")) |> 
+  add_stat_label(label=list(all_categorical()~"n/N (%)",
+                            all_continuous()~"média (DP)",
+                            c("ntProBnp", "creatinine")~"mediana (IIQ)")) |> 
+  modify_header(p.value="**P**",
+                label="**Característica**",
+                update = list(stat_1 ~ "**Validação** (N = {n})",
+                              stat_2 ~ "**Derivação** (N = {n})")) |> 
+  modify_spanning_header(c("stat_1", "stat_2") ~ c("**Subgrupos**")) |> 
+  add_overall() |>
+  modify_footnote(update=everything()~NA) |>
+  as_gt() |> 
+  opt_table_font(font = google_font("Times"))
+
+baselineChars
+gtsave(baselineChars, filename = "tables/baselineChars.png")
+
+```
+
+Split cohort into train and test subsets. Impute each subset.
+
+```{r, warning=FALSE}
+
+# Split cohort
+train <- filter(acs, trainSet == TRUE)
+test <- filter(acs, trainSet == TRUE)
+
+# Remove "subgroup" variable from subsets
+train$trainSet <- NULL
+test$trainSet <- NULL
+
+# Create predictor matrix
+p <- ncol(train)
+pMatrix <- matrix(rep(1, p^2),
+                  nrow = p,
+                  ncol = p)
+diag(pMatrix) <- 0
+
+# Define imputation method for each predictor
+dput(names(train))
+impMethod <- c("logreg", "logreg", "pmm", "logreg", "pmm", "logreg", 
+               "logreg", "logreg", "logreg", "logreg", "logreg", "logreg",
+               "logreg", "logreg", "logreg", "logreg", "logreg", "pmm", 
+               "pmm", "logreg", "logreg", "logreg", "pmm", "pmm", "pmm")
+
+# Impute each subset
+library(mice)
+
+impTrain <- mice(train,
+                 m = 40,
+                 maxit = 100,
+                 predictorMatrix = pMatrix,
+                 method = impMethod)
+impTest <- mice(test,
+                m = 40,
+                maxit = 100,
+                predictor_matrix = pMatrix,
+                method = impMethod,
+                seed = 1)
+
+save(impTrain, file = "imputation/train.rda")
+save(impTest, file = "imputation/test.rda")
+
+impTrain
+impTest
+```
+
+Diagnostics for missing data and multiple imputation.
+
+```{r, warning=FALSE}
+
+# Packages
+library(Hmisc)
+library(VIM)
+library(mice)
+
+# Diagnostics for missing data
+dput(names(acs))
+predVars <- c("age", "maleSex", "bmi", "currentSmoker",
+              "dyslipidemia", "diabetesMellitus", "hypertension",
+              "kidneyDisease", "peripheralDisease", "carotidDisease",
+              "coronaryDisease", "familyHistory", "priorMi", "priorStroke",
+              "priorAspirin", "pulse", "systolicBp", "killip", "ecgChanges",
+              "myocardialInjury", "ntProBnp", "creatinine", "hemoglobin")
+predLabels <-
+  acs[predVars] |> 
+  labelled::var_label(unlist = TRUE) |> 
+  as.vector() |> 
+  stringr::str_replace("\\([:graph:]*", "") |>
+  stringr::str_trim()
+
+# Missing values per variable combination
+acs [predVars] |> 
+  VIM::aggr(labels = predLabels,
+            col = c("#6657fe", "#fd0a45"),
+            combined = TRUE,
+            sortVars = TRUE,
+            sortCombs = TRUE,
+            oma = c(24, 1, 1, 1),
+            cex.axis = 1,
+            ylabs = "")
+
+# Hierarchical cluster analysis of missing values
+acs[predVars] |> 
+  Hmisc::naclus() |>
+  plot(ylab = "Fração dos Valores Faltantes em Comum entre Variáveis")
+
+# Number of missing values per variable
+acs[predVars] |> 
+  Hmisc::naclus() |>
+  naplot(which="na per var")
+
+# Number of missing values per observation
+acs[predVars] |> 
+  Hmisc::naclus() |>
+  naplot(which="na per obs")
+
+# Number of other variables missing, when the indicated variable is missing
+acs[predVars] |> 
+  Hmisc::naclus() |>
+  naplot(which="mean na")
+
+# Trace lines of mice algorithm
+load("imputation/train.rda")
+plot(impTrain, 
+     layout = c(4, 12)) |> 
+  update(main = "Linhas de rastreio do algoritmo de imputação",
+         xlab = "Índice de iteração",
+         ylab = "Valor estimado")
+
+load("imputation/test.rda")
+plot(impTest, 
+     layout = c(4, 12)) |> 
+  update(main = "Linhas de rastreio do algoritmo de imputação",
+         xlab = "Índice de iteração",
+         ylab = "Valor estimado")
+
+# Compare observed and imputed data
+densityplot(impTrain,
+            ~bmi+pulse+systolicBp+ntProBnp+creatinine+hemoglobin) |> 
+  update(main = "Estimativas de Densidade por Kernel, para Derivação",
+         xlab = "Valores da variável",
+         ylab = "Densidade")
+densityplot(impTest,
+            ~bmi+pulse+systolicBp+ntProBnp+creatinine+hemoglobin) |> 
+  update(main = "Estimativas de Densidade por Kernel, para Validação",
+         xlab = "Valores da variável",
+         ylab = "Densidade")
+```
+
+Regression: sample size calculation.
+
+```{r, warning=FALSE}
+
+# Rule of thumb: 10 events per predictor parameter
+nPredVars <- function(nEvents, epp){
+  nEvents / epp
+}
+
+# Train subset
+train <- filter(acs, trainSet == TRUE)
+
+# Number of candidate predictors for mace
+nPredVars(nEvents = sum(train$mace, na.rm = TRUE),
+          epp = 10)
+
+# Number of candicate predictors for major bleeding
+nPredVars(nEvents = sum(train$majorBleeding, na.rm = TRUE),
+          epp = 10)
+```
+
+Regression: perform univariate analysis to select predictors.
+
+```{r, warning=FALSE}
+
+# Associations with mace
+acs |> 
+  filter(trainSet == TRUE) |> 
+  mutate(trainSet = NULL) |>
+  select(-c(majorBleeding)) |> 
+  tbl_summary(by = mace,
+              missing = "no",
+              statistic = list(all_categorical()~"{n}/{N} ({p}%)",
+                                        all_continuous()~"{mean} ± {sd}",
+                                        c("ntProBnp", "creatinine")~
+                                          "{median} ({p25}-{p75})")) |>
+  add_stat_label(label=list(all_categorical()~"n/N (%)",
+                            all_continuous()~"média (DP)",
+                            c("ntProBnp", "creatinine")~"mediana (IIQ)")) |>
+  modify_header(p.value="**P**",
+                label="**Característica**",
+                update = list(stat_1 ~ "**Não** (N = {n})",
+                              stat_2 ~ "**Sim** (N = {n})")) |> 
+  add_p(pvalue_fun = ~style_pvalue(.x, digits = 3)) |> 
+  modify_spanning_header(c("stat_1", "stat_2")~"**Óbito ou Reinfarto**") |> 
+  modify_footnote(update = everything() ~ NA) |> 
+  bold_p(t = 0.005) |> 
+  as_gt() |> 
+  opt_table_font(font = google_font("Times"))
+
+# Associations with major bleeding
+acs |> 
+  filter(trainSet == TRUE) |> 
+  mutate(trainSet = NULL) |>
+  select(-c(mace)) |> 
+  tbl_summary(by = majorBleeding,
+              missing = "no",
+              statistic = list(all_categorical()~"{n}/{N} ({p}%)",
+                                        all_continuous()~"{mean} ± {sd}",
+                                        c("ntProBnp", "creatinine")~
+                                          "{median} ({p25}-{p75})")) |>
+  add_stat_label(label=list(all_categorical()~"n/N (%)",
+                            all_continuous()~"média (DP)",
+                            c("ntProBnp", "creatinine")~"mediana (IIQ)")) |>
+  modify_header(p.value="**P**",
+                label="**Característica**",
+                update = list(stat_1 ~ "**Não** (N = {n})",
+                              stat_2 ~ "**Sim** (N = {n})")) |> 
+  add_p(pvalue_fun = ~style_pvalue(.x, digits = 3)) |> 
+  modify_spanning_header(c("stat_1", "stat_2")~"**Sangramento Maior**") |> 
+  modify_footnote(update = everything() ~ NA) |> 
+  bold_p(t = 0.001) |> 
+  as_gt() |> 
+  opt_table_font(font = google_font("Times"))
+```
+
+Regression: derive model and validate predictions.
+
+```{r, warning=FALSE}
+
+# Load rms package to perform logistic regression
+library(rms)
+
+# Load imputed train and test subgroups
+load("imputation/train.rda")
+load("imputation/test.rda")
+
+# Load original train and test subgroups
+train <- filter(acs, trainSet == TRUE)
+test <- filter(acs, trainSet == FALSE)
+
+# Look at variable names to select predictors
+dput(names(acs)) |> paste(collapse = "+")
+
+# Specify datadist for logistic regression
+dd <- datadist(train)
+options(datadist = "dd")
+
+# Derive logistic regression for mace
+lrmMace <- fit.mult.impute(mace~age+kidneyDisease+pulse+killip+ntProBnp+creatinine+hemoglobin,
+                           fitter = glm,
+                           xtrans = impTrain,
+                           data = train) |> 
+  step()
+lrmMace <- fit.mult.impute(lrmMace$formula,
+                           fitter = lrm,
+                           xtrans = impTrain,
+                           data = train)
+save(lrmMace, file="models/lrmMace.rda")
+
+# Validate logistic regression for mace
+predictionLrmMace <- predict(lrmMace,
+                             newdata = complete(impTest, 1),
+                             type = "fitted")
+save(predictionLrmMace, file="models/predictionLrmMace.rda")
+
+
+# Derive logistic regression for major bleeding
+lrmBleeding <- fit.mult.impute(majorBleeding~age+killip+myocardialInjury+ntProBnp+hemoglobin,
+                           fitter = glm,
+                           xtrans = impTrain,
+                           data = train) |> 
+  step()
+lrmBleeding <- fit.mult.impute(lrmBleeding$formula,
+                           fitter = lrm,
+                           xtrans = impTrain,
+                           data = train)
+save(lrmBleeding, file="models/lrmBleeding.rda")
+
+# Validate logistic regression for major bleeding
+predictionLrmBleeding <- predict(lrmBleeding,
+                             newdata = complete(impTest, 1),
+                             type = "fitted")
+save(predictionLrmBleeding, file="models/predictionLrmBleeding.rda")
+```
+
+SVM: train model, assess variable importance, and validate predictions.
+
+```{r, warning=FALSE}
+
+
+# Load caret to perform svm
+library(caret)
+
+# Set parameters for model training
+trainControlSvm <- trainControl(method = "repeatedcv",
+                                number = 10,
+                                repeats = 100,
+                                classProbs = TRUE)
+
+# Train svm for predicting mace
+svmMace <- train(make.names(mace) ~ .,
+                 data = select(complete(impTrain, 1),
+                               -c(majorBleeding)),
+                 method = "svmRadial",
+                 trControl = trainControlSvm,
+                 metric =  "ROC",
+                 tuneLength = 10,
+                 preProcess = c("center", "scale"))
+save(svmMace, file="models/svmMace.rda")
+
+# Variable importance of svm for predicting mace
+varImpSvmMace <- varImp(svmMace, scale = FALSE)
+save(varImpSvmMace, file="models/varImpSvmMace.rda")
+
+# Validate mace predictions
+predictionSvmMace <- predict(svmMace, 
+                             newdata = complete(impTest, 1),
+                             type="prob")
+save(predictionSvmMace, file="models/predictionSvmMace.rda")
+
+# Train svm for predicting major bleeding
+svmBleeding <- train(make.names(majorBleeding) ~ .,
+                 data = select(complete(impTrain, 1),
+                               -c(mace)),
+                 method = "svmRadial",
+                 trControl = trainControlSvm,
+                 metric =  "ROC",
+                 tuneLength = 10,
+                 preProcess = c("center", "scale"))
+save(svmBleeding, file="models/svmBleeding.rda")
+
+# Variable importance of svm for predicting major bleeding
+varImpSvmBleeding <- varImp(svmBleeding, scale = FALSE)
+save(varImpSvmBleeding, file="models/varImpSvmBleeding.rda")
+
+# Validate bleeding predictions
+predictionSvmBleeding <- predict(svmBleeding, 
+                             newdata = complete(impTest, 1),
+                             type="prob")
+save(predictionSvmBleeding, file="models/predictionSvmBleeding.rda")
+```
+
+XGBoost: train model, assess variable importance, and validate predictions.
+
+```{r, warning=FALSE}
+
+# Load caret to perform xgb
+library(caret)
+
+# Set parameters for model training
+trainControlXgb <- trainControl(method = "cv",
+                                number = 10,
+                                classProbs = TRUE,
+                                allowParallel = TRUE)
+
+# Train xgb for predicting mace
+xgbMace <- train(make.names(mace) ~ .,
+                 data = select(complete(impTrain, 1),
+                               -c(majorBleeding)),
+                 method = "xgbTree",
+                 preProcess = c("center", "scale"),
+                 trControl = trainControlXgb,
+                 tuneLength = 10,
+                 verbose = TRUE,
+                 metric =  "ROC")
+save(xgbMace, file="models/xgbMace.rda")
+
+# Variable importance of svm for predicting mace
+varImpXgbMace <- varImp(xgbMace, scale = FALSE)
+save(varImpXgbMace, file="models/varImpXgbMace.rda")
+
+# Validate mace predictions
+predictionXgbMace <- predict(xgbMace, 
+                             newdata = complete(impTest, 1),
+                             type="prob")
+save(predictionXgbMace, file="models/predictionXgbMace.rda")
+
+# Train svm for predicting major bleeding
+xgbBleeding <- train(make.names(majorBleeding) ~ .,
+                 data = select(complete(impTrain, 1),
+                               -c(mace)),
+                 method = "xgbTree",
+                 preProcess = c("center", "scale"),
+                 trControl = trainControlXgb,
+                 tuneLength = 10,
+                 verbose = TRUE,
+                 metric =  "ROC")
+save(xgbBleeding, file="models/xgbBleeding.rda")
+
+# Variable importance of svm for predicting major bleeding
+varImpXgbBleeding <- varImp(xgbBleeding, scale = FALSE)
+save(varImpXgbBleeding, file="models/varImpXgbBleeding.rda")
+
+# Validate bleeding predictions
+predictionXgbBleeding <- predict(xgbBleeding, 
+                             newdata = complete(impTest, 1),
+                             type="prob")
+save(predictionXgbBleeding, file="models/predictionXgbBleeding.rda")
+```
+
+Logistic regression results for predicting MACE
+
+```{r, warning=FALSE}
+
+# Packages
+library(tidyverse)
+library(gridExtra)
+library(rms)
+
+# Dataframe containg results
+load("models/lrmMace.rda")
+
+dfOrMace <- data.frame(label = c("Intercept",
+                                 lrmMace[["Design"]][["label"]]),
+                       beta = lrmMace$coefficients,
+                       se = sqrt(diag(lrmMace$var)),
+                       row.names = NULL) |>
+  filter(label != "Intercept") |> 
+  mutate(or = exp(beta),
+         ll = or + qnorm(0.025)*se,
+         ul = or + qnorm(0.975)*se,
+         z = beta/se,
+         p = 1 - pchisq(z^2, 1),
+         p = ifelse(p < 0.001, "< 0,001", as.character(round(p, 3))))
+
+# Forest plot
+forestMace <- ggplot(dfOrMace,
+       aes(x = or, 
+           y = reorder(label, or))) +
+  geom_vline(xintercept = 1,
+             color = "black",
+             linetype = "dashed",
+             cex = 0.5,
+             alpha = 0.5) +
+  geom_errorbarh(aes(xmin = ll,
+                     xmax = ul),
+                 height = 0) +
+  geom_point(shape = 15, 
+             size = 5,
+             color = "#009fc3") +
+  scale_x_log10(limits = c(0.5, 5),
+                breaks = c(0.5, 1, 2.5, 5),
+                expand = expansion(0, 0)) +
+  labs(y = "",
+       subtitle = "Razão de Chances (IC 95%)\n") +
+  theme_bw() +
+  theme(panel.border = element_blank(),
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.ticks.length.x = unit(7.5, "pt"),
+        axis.line.x = element_line(color = "black"),
+        axis.text.y = element_text(size = 12,
+                                   color = "black",
+                                   family = "Montserrat",
+                                   margin = margin(r = 20),
+                                   hjust = 0),
+        axis.text.x.bottom = element_text(size = 12,
+                                          color = "black",
+                                          family = "Montserrat",
+                                          margin = margin(t = 10, b = 20)),
+        axis.title.x = element_blank(),
+        plot.subtitle = element_text(size = 12,
+                                    hjust = 0.5,
+                                    color = "black",
+                                    family = "Montserrat",
+                                    face = "bold"))
+
+# Base table
+tableBaseMace <- ggplot(dfOrMace, aes(y=label)) +
+  labs(x = "",
+       y = NULL) +
+  theme(plot.title = element_text(hjust = 0.5,
+                                  size=12), 
+        axis.text.x = element_text(color="white", 
+                                   hjust = -3, 
+                                   size = 25),
+        axis.line = element_blank(),
+        axis.text.y = element_blank(), 
+        axis.ticks = element_blank(),
+        axis.title.y = element_blank(), 
+        legend.position = "none",
+        panel.background = element_blank(), 
+        panel.border = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        plot.background = element_blank())
+
+# Point estimate table
+tableEstimateMace <- tableBaseMace + 
+  labs(title = "\n") +
+  geom_text(aes(y = reorder(label, or),
+                x = 1,
+                label = paste(sprintf("%0.2f",
+                                      round(or, 1)),
+                              " (",
+                              sprintf("%0.2f",
+                                      round(ll, 1)),
+                              "-",
+                              sprintf("%0.2f",
+                                      round(ul, 1)),
+                              ")", 
+                              sep = "")),
+            size = 4,
+            family = "Montserrat",
+            hjust = 0.5) + ## decimal places
+  theme(title = element_text(size = 12,
+                             color = "black",
+                             family = "Montserrat",
+                             face = "bold"))
+
+# P value table
+tablePMace <- tableBaseMace + 
+  labs(title = "P\n") +
+  geom_text(aes(y = reorder(label, or),
+                x = 1,
+                label = p),
+            size = 4,
+            color = "black",
+            family = "Montserrat",
+            hjust = 0.8) +
+  theme(title = element_text(size = 12,
+                             color = "black",
+                             family = "Montserrat",
+                             face = "bold"))
+
+
+# combining elements of forest plot
+tableLayout <-  matrix(c(1,1,1,1,1,1,2,2,2,3,3), nrow = 1)
+grid.arrange(forestMace, tableEstimateMace, tablePMace, layout_matrix = tableLayout)
+```
+
+Logistic regression results for predicting major bleeding.
+
+```{r, warning=FALSE}
+
+# Packages
+library(tidyverse)
+library(gridExtra)
+library(rms)
+
+# Dataframe containg results
+load("models/lrmBleeding.rda")
+
+dfOrBleeding <- data.frame(label = c("Intercept",
+                                 lrmBleeding[["Design"]][["label"]]),
+                       beta = lrmBleeding$coefficients,
+                       se = sqrt(diag(lrmBleeding$var)),
+                       row.names = NULL) |>
+  filter(label != "Intercept") |> 
+  mutate(or = exp(beta),
+         ll = or + qnorm(0.025)*se,
+         ul = or + qnorm(0.975)*se,
+         z = beta/se,
+         p = 1 - pchisq(z^2, 1),
+         p = ifelse(p < 0.001, "< 0,001", as.character(round(p, 3))))
+
+# Forest plot
+forestBleeding <- ggplot(dfOrBleeding,
+       aes(x = or, 
+           y = reorder(label, or))) +
+  geom_vline(xintercept = 1,
+             color = "black",
+             linetype = "dashed",
+             cex = 0.5,
+             alpha = 0.5) +
+  geom_errorbarh(aes(xmin = ll,
+                     xmax = ul),
+                 height = 0) +
+  geom_point(shape = 15, 
+             size = 5,
+             color = "#6cb43f") +
+  scale_x_log10(limits = c(0.5, 5),
+                breaks = c(0.5, 1, 2.5, 5),
+                expand = expansion(0, 0)) +
+  labs(y = "",
+       subtitle = "Razão de Chances (IC 95%)\n") +
+  theme_bw() +
+  theme(panel.border = element_blank(),
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.ticks.length.x = unit(7.5, "pt"),
+        axis.line.x = element_line(color = "black"),
+        axis.text.y = element_text(size = 12,
+                                   color = "black",
+                                   family = "Montserrat",
+                                   margin = margin(r = 20),
+                                   hjust = 0),
+        axis.text.x.bottom = element_text(size = 12,
+                                          color = "black",
+                                          family = "Montserrat",
+                                          margin = margin(t = 10, b = 20)),
+        axis.title.x = element_blank(),
+        plot.subtitle = element_text(size = 12,
+                                    hjust = 0.5,
+                                    color = "black",
+                                    family = "Montserrat",
+                                    face = "bold"))
+
+# Base table
+tableBaseBleeding <- ggplot(dfOrBleeding, aes(y=label)) +
+  labs(x = "",
+       y = NULL) +
+  theme(plot.title = element_text(hjust = 0.5,
+                                  size=12), 
+        axis.text.x = element_text(color="white", 
+                                   hjust = -3, 
+                                   size = 25),
+        axis.line = element_blank(),
+        axis.text.y = element_blank(), 
+        axis.ticks = element_blank(),
+        axis.title.y = element_blank(), 
+        legend.position = "none",
+        panel.background = element_blank(), 
+        panel.border = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), 
+        plot.background = element_blank())
+
+# Point estimate table
+tableEstimateBleeding <- tableBaseBleeding + 
+  labs(title = "\n") +
+  geom_text(aes(y = reorder(label, or),
+                x = 1,
+                label = paste(sprintf("%0.2f",
+                                      round(or, 1)),
+                              " (",
+                              sprintf("%0.2f",
+                                      round(ll, 1)),
+                              "-",
+                              sprintf("%0.2f",
+                                      round(ul, 1)),
+                              ")", 
+                              sep = "")),
+            size = 4,
+            family = "Montserrat",
+            hjust = 0.5) + 
+  theme(title = element_text(size = 12,
+                             color = "black",
+                             family = "Montserrat",
+                             face = "bold"))
+
+# P value table
+tablePBleeding <- tableBaseBleeding + 
+  labs(title = "P\n") +
+  geom_text(aes(y = reorder(label, or),
+                x = 1,
+                label = p),
+            size = 4,
+            color = "black",
+            family = "Montserrat",
+            hjust = 0.8) +
+  theme(title = element_text(size = 12,
+                             color = "black",
+                             family = "Montserrat",
+                             face = "bold"))
+
+
+# combining elements of forest plot
+tableLayout <-  matrix(c(1,1,1,1,1,1,2,2,2,3,3), nrow = 1)
+grid.arrange(forestBleeding, tableEstimateBleeding, tablePBleeding, layout_matrix = tableLayout)
+```
+
+Variable importance in machine learning predictions.
+
+```{r, warning=FALSE}
+
+# Dataframe of variable importance estimates
+load("models/varImpSvmMace.rda")
+load("models/varImpXgbMace.rda")
+load("models/varImpSvmBleeding.rda")
+load("models/varImpXgbBleeding.rda")
+
+dfVarImp <- data.frame(label = varLabels[-c(1,2)] |> 
+                         str_replace("\\([:graph:]*", ""),
+                       svmMace = varImpSvmMace$importance$Overall,
+                       svmBleeding = varImpSvmBleeding$importance$Overall,
+                       xgbMace = varImpXgbMace$importance$Overall,
+                       xgbBleeding=varImpXgbBleeding$importance$Overall) |>
+  mutate(scaledSvmMace = svmMace / max(svmMace) * 100,
+         scaledSvmBleeding = svmBleeding / max(svmBleeding) * 100,
+         scaledXgbMace = xgbMace / max(xgbMace) * 100,
+         scaledXgbBleeding = xgbBleeding / max(xgbBleeding) * 100,
+         meanMace = (scaledSvmMace + scaledXgbMace) / 2,
+         meanBleeding = (scaledSvmBleeding + scaledXgbBleeding) / 2)
+
+# Importance for MACE
+ggplot(dfVarImp, 
+       aes(y = reorder(label, meanMace))) +
+  geom_segment(aes(y = reorder(label, meanMace), 
+                   yend = reorder(label, meanMace),
+                   x = scaledSvmMace,
+                   xend = scaledXgbMace),
+               color = "lightgrey") +
+  geom_point(aes(x = scaledSvmMace,
+                 color = "SVM"),
+             alpha = 0.7) +
+  geom_point(aes(x = scaledXgbMace,
+                 color = "XGB"),
+             alpha = 0.7) +
+  scale_y_discrete(position = "right") +
+  scale_x_continuous(position = "top") +
+  labs(x = "Estimativa Dimensionada de Desempenho (%)\n") +
+  scale_color_manual(name = "Modelo preditor de\neventos cardiovasculares",
+                     breaks = c("SVM", "XGB"),
+                     values = c("SVM" = "#009fc3", "XGB" = "#6cb43f")) +
+  theme_bw() +
+  theme(panel.border = element_blank(),
+        panel.background = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line.y = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title.y = element_blank(),
+        axis.title.x = element_text(size = 11,
+                                   color = "black",
+                                   family = "Montserrat",
+                                   face = "bold"),
+        axis.text.y = element_text(size = 10,
+                                   color = "black",
+                                   family = "Montserrat",
+                                   margin = margin(r = 20),
+                                   hjust = 0),
+        axis.text.x = element_text(size = 9,
+                                   color = "black",
+                                   family = "Montserrat"),
+        legend.position = c(0.95, 0.05),
+        legend.justification = c("right", "bottom"),
+        legend.box.just = "top",
+        legend.margin = margin(6, 6, 6, 6),
+        legend.direction = "horizontal",
+        legend.title = element_text(size = 9,
+                                   color = "black",
+                                   family = "Montserrat"),
+        legend.text = element_text(size = 9,
+                                   color = "black",
+                                   family = "Montserrat"))
+
+# Importance for major bleeding
+ggplot(dfVarImp, 
+       aes(y = reorder(label, meanBleeding))) +
+  geom_segment(aes(y = reorder(label, meanBleeding), 
+                   yend = reorder(label, meanBleeding),
+                   x = scaledSvmBleeding,
+                   xend = scaledXgbBleeding),
+               color = "lightgrey") +
+  geom_point(aes(x = scaledSvmBleeding,
+                 color = "SVM"),
+             alpha = 0.7) +
+  geom_point(aes(x = scaledXgbBleeding,
+                 color = "XGB"),
+             alpha = 0.7) +
+  scale_y_discrete(position = "right") +
+  scale_x_continuous(position = "top") +
+  labs(x = "Estimativa Dimensionada de Desempenho (%)\n") +
+  scale_color_manual(name = "Modelo preditor de\nsangramento maior",
+                     breaks = c("SVM", "XGB"),
+                     values = c("SVM" = "#009fc3", "XGB" = "#6cb43f")) +
+  theme_bw() +
+  theme(panel.border = element_blank(),
+        panel.background = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line.y = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title.y = element_blank(),
+        axis.title.x = element_text(size = 11,
+                                   color = "black",
+                                   family = "Montserrat",
+                                   face = "bold"),
+        axis.text.y = element_text(size = 10,
+                                   color = "black",
+                                   family = "Montserrat",
+                                   margin = margin(r = 20),
+                                   hjust = 0),
+        axis.text.x = element_text(size = 9,
+                                   color = "black",
+                                   family = "Montserrat"),
+        legend.position = c(0.95, 0.05),
+        legend.justification = c("right", "bottom"),
+        legend.box.just = "top",
+        legend.margin = margin(6, 6, 6, 6),
+        legend.direction = "horizontal",
+        legend.title = element_text(size = 9,
+                                   color = "black",
+                                   family = "Montserrat"),
+        legend.text = element_text(size = 9,
+                                   color = "black",
+                                   family = "Montserrat"))
+```
+
+ROC and calibration curves for mace.
+
+```{r, warning=FALSE}
+
+# Packages
+library(pROC)
+library(mice)
+library(tidyverse)
+
+# Data
+load("imputation/test.rda")
+load("models/predictionLrmMace.rda")
+load("models/predictionSvmMace.rda")
+load("models/predictionXgbMace.rda")
+load("models/predictionLrmBleeding.rda")
+load("models/predictionSvmBleeding.rda")
+load("models/predictionXgbBleeding.rda")
+
+predictions <- data.frame(mace = complete(impTest, 1)[["mace"]],
+                              lrmMace = predictionLrmMace,
+                              svmMace = predictionSvmMace[[2]],
+                              xgbMace = predictionXgbMace[[2]],
+                          bleeding = complete(impTest, 1)[["mace"]],
+                              lrmBleeding = predictionLrmBleeding,
+                              svmBleeding = predictionSvmBleeding[[2]],
+                              xgbBleeding = predictionXgbBleeding[[2]])
+
+# ROC objects
+rocLrmMace <- roc(predictions$mace, predictions$lrmMace)
+rocSvmMace <- roc(predictions$mace, predictions$svmMace)
+rocXgbMace <- roc(predictions$mace, predictions$xgbMace)
+
+rocLrmBleeding <- roc(predictions$bleeding, predictions$lrmBleeding)
+rocSvmBleeding <- roc(predictions$bleeding, predictions$svmBleeding)
+rocXgbBleeding <- roc(predictions$bleeding, predictions$xgbBleeding)
+
+# ROC curves
+rocMace <- ggroc(data = list(rocLrmMace,
+                  rocSvmMace,
+                  rocXgbMace),
+      legacy.axes = TRUE) +
+  geom_abline(linetype = "dashed", 
+              alpha=0.8,
+              color = "grey") +
+  scale_color_manual(name = "",
+                     labels = c("Regressão", "SVM", "XGB"),
+                     values = c("#009fc3", "#6cb43f", "#850a70")) +
+  scale_y_continuous(labels = scales::label_percent(suffix = ""),
+                     expand = expansion(0,0)) +
+  scale_x_continuous(labels = scales::label_percent(suffix = ""),
+                     expand = expansion(0,0)) +
+  labs(x = "\n1 - Especificidade (%)",
+       y = "Sensibilidade (%)\n",
+       subtitle = "Eventos Cardiovasculares Adversos Graves\n") +
+  theme_bw() +
+  theme(panel.border = element_blank(),
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(),
+        axis.ticks.length = unit(7.5, "pt"),
+        axis.title = element_text(size = 12,
+                                  family = "Montserrat"),
+        axis.text = element_text(size = 10,
+                                 family = "Montserrat",
+                                 color = "black"),
+        legend.position = c(0.95, 0.05),
+        legend.justification = c("right", "bottom"),
+        legend.box.just = "top",
+        legend.margin = margin(6, 6, 6, 6),
+        legend.text = element_text(size = 11,
+                                   color = "black",
+                                   family = "Montserrat"),
+        plot.subtitle = element_text(size = 12,
+                                    hjust = 0.5,
+                                    color = "black",
+                                    family = "Montserrat",
+                                    face = "bold"))
+
+rocBleeding <- ggroc(data = list(rocLrmBleeding,
+                  rocSvmBleeding,
+                  rocXgbBleeding),
+      legacy.axes = TRUE) +
+  geom_abline(linetype = "dashed", 
+              alpha=0.8,
+              color = "grey") +
+  scale_color_manual(name = "",
+                     labels = c("Regressão", "SVM", "XGB"),
+                     values = c("#009fc3", "#6cb43f", "#850a70")) +
+  scale_y_continuous(labels = scales::label_percent(suffix = ""),
+                     expand = expansion(0,0)) +
+  scale_x_continuous(labels = scales::label_percent(suffix = ""),
+                     expand = expansion(0,0)) +
+  labs(x = "\n1 - Especificidade (%)",
+       y = "Sensibilidade (%)\n",
+       subtitle = "Sangramento Grave\n") +
+  theme_bw() +
+  theme(panel.border = element_blank(),
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(),
+        axis.ticks.length = unit(7.5, "pt"),
+        axis.title = element_text(size = 12,
+                                  family = "Montserrat"),
+        axis.text = element_text(size = 10,
+                                 family = "Montserrat",
+                                 color = "black"),
+        legend.position = c(0.95, 0.05),
+        legend.justification = c("right", "bottom"),
+        legend.box.just = "top",
+        legend.margin = margin(6, 6, 6, 6),
+        legend.text = element_text(size = 11,
+                                   color = "black",
+                                   family = "Montserrat"),
+        plot.subtitle = element_text(size = 12,
+                                    hjust = 0.5,
+                                    color = "black",
+                                    family = "Montserrat",
+                                    face = "bold"))
+```
+
+Assess and compare ROC curves.
+```{r, warning=FALSE}
+
+# Packages
+library(pROC)
+library(mice)
+library(tidyverse)
+
+# Data
+load("imputation/test.rda")
+load("models/predictionLrmMace.rda")
+load("models/predictionSvmMace.rda")
+load("models/predictionXgbMace.rda")
+load("models/predictionLrmBleeding.rda")
+load("models/predictionSvmBleeding.rda")
+load("models/predictionXgbBleeding.rda")
+
+predictions <- data.frame(mace = complete(impTest, 1)[["mace"]],
+                              lrmMace = predictionLrmMace,
+                              svmMace = predictionSvmMace[[2]],
+                              xgbMace = predictionXgbMace[[2]],
+                          bleeding = complete(impTest, 1)[["mace"]],
+                              lrmBleeding = predictionLrmBleeding,
+                              svmBleeding = predictionSvmBleeding[[2]],
+                              xgbBleeding = predictionXgbBleeding[[2]])
+
+# ROC objects
+rocLrmMace <- roc(predictions$mace, predictions$lrmMace)
+rocSvmMace <- roc(predictions$mace, predictions$svmMace)
+rocXgbMace <- roc(predictions$mace, predictions$xgbMace)
+
+rocLrmBleeding <- roc(predictions$bleeding, predictions$lrmBleeding)
+rocSvmBleeding <- roc(predictions$bleeding, predictions$svmBleeding)
+rocXgbBleeding <- roc(predictions$bleeding, predictions$xgbBleeding)
+
+# Assess c-statistics
+rocLrmMace; ci.auc(rocLrmMace)
+rocSvmMace; ci.auc(rocSvmMace)
+rocXgbMace; ci.auc(rocXgbMace)
+
+rocLrmBleeding; ci.auc(rocLrmBleeding)
+rocSvmBleeding; ci.auc(rocSvmBleeding)
+rocXgbBleeding; ci.auc(rocXgbBleeding)
+
+# DeLong's test
+roc.test(rocLrmMace, rocSvmMace)
+roc.test(rocLrmMace, rocXgbMace)
+
+roc.test(rocLrmBleeding, rocSvmBleeding)
+roc.test(rocLrmBleeding, rocXgbBleeding)
+
+```
+
+
+Assess calibration of predictions.
+
+```{r, warning=FALSE}
+
+# Package
+#library("devtools"); install_github("BavoDC/CalibrationCurves", dependencies = TRUE)
+library("CalibrationCurves")
+library(mice)
+library(ggmap)
+library(tidyverse)
+
+# Data
+load("imputation/test.rda")
+load("models/predictionLrmMace.rda")
+load("models/predictionSvmMace.rda")
+load("models/predictionXgbMace.rda")
+load("models/predictionLrmBleeding.rda")
+load("models/predictionSvmBleeding.rda")
+load("models/predictionXgbBleeding.rda")
+
+predictions <- data.frame(mace = complete(impTest, 1)[["mace"]],
+                              lrmMace = predictionLrmMace,
+                              svmMace = predictionSvmMace[[2]],
+                              xgbMace = predictionXgbMace[[2]],
+                          bleeding = complete(impTest, 1)[["mace"]],
+                              lrmBleeding = predictionLrmBleeding,
+                              svmBleeding = predictionSvmBleeding[[2]],
+                              xgbBleeding = predictionXgbBleeding[[2]])
+
+# Obtain calibration slope and intercept
+calEstimates <- 
+  data.frame(slopeLrmMace = val.prob.ci.2(y = predictions$mace,
+                             p = predictions$lrmMace)[["Calibration"]][["Slope"]],
+             interceptLrmMace = val.prob.ci.2(y = predictions$mace,
+                                              p = predictions$lrmMace)[["Calibration"]][["Intercept"]],
+             slopeSvmMace = val.prob.ci.2(y = predictions$mace,
+                                          p = predictions$svmMace)[["Calibration"]][["Slope"]],
+             interceptSvmMace = val.prob.ci.2(y = predictions$mace,
+                                              p = predictions$svmMace)[["Calibration"]][["Intercept"]],
+             slopeXgbMace = val.prob.ci.2(y = predictions$mace,
+                             p = predictions$xgbMace)[["Calibration"]][["Slope"]],
+             interceptXgbMace = val.prob.ci.2(y = predictions$mace,
+                                              p = predictions$xgbMace)[["Calibration"]][["Intercept"]],
+             slopeLrmBleeding = val.prob.ci.2(y = predictions$bleeding,
+                                              p = predictions$lrmBleeding)[["Calibration"]][["Slope"]],
+             interceptLrmBleeding = val.prob.ci.2(y = predictions$bleeding,
+                                                  p = predictions$lrmBleeding)[["Calibration"]][["Intercept"]],
+             slopeSvmBleeding = val.prob.ci.2(y = predictions$bleeding,
+                                              p = predictions$svmBleeding)[["Calibration"]][["Slope"]],
+             interceptSvmBleeding = val.prob.ci.2(y = predictions$bleeding,
+                                                  p = predictions$svmBleeding)[["Calibration"]][["Intercept"]],
+             slopeXgbBleeding = val.prob.ci.2(y = predictions$bleeding,
+                                              p = predictions$xgbBleeding)[["Calibration"]][["Slope"]],
+             interceptXgbBleeding = val.prob.ci.2(y = predictions$bleeding,
+                                              p = predictions$xgbBleeding)[["Calibration"]][["Intercept"]])
+
+calEstimatesLrmMace <- c(paste("Inclinação: ",
+                               calEstimates["Point estimate", "slopeLrmMace"] |> round(2),
+                               " (",
+                               calEstimates["Lower confidence limit.2.5 %", "slopeLrmMace"] |> round(2),
+                               "-",
+                               calEstimates["Upper confidence limit.97.5 %", "slopeLrmMace"] |> round(2),
+                               ")",
+                               sep = ""),
+                         paste("Intercepto: ",
+                               calEstimates["Point estimate", "interceptLrmMace"] |> round(2),
+                               " (",
+                               calEstimates["Lower confidence limit.2.5 %", "interceptLrmMace"] |> round(2),
+                               "-",
+                               calEstimates["Upper confidence limit.97.5 %", "interceptLrmMace"] |> round(2),
+                               ")",
+                               sep = ""))
+
+calEstimatesSvmMace <- c(paste("Inclinação: ",
+                               calEstimates["Point estimate", "slopeSvmMace"] |> round(2),
+                               " (",
+                               calEstimates["Lower confidence limit.2.5 %", "slopeSvmMace"] |> round(2),
+                               "-",
+                               calEstimates["Upper confidence limit.97.5 %", "slopeSvmMace"] |> round(2),
+                               ")",
+                               sep = ""),
+                         paste("Intercepto: ",
+                               calEstimates["Point estimate", "interceptSvmMace"] |> round(2),
+                               " (",
+                               calEstimates["Lower confidence limit.2.5 %", "interceptSvmMace"] |> round(2),
+                               "-",
+                               calEstimates["Upper confidence limit.97.5 %", "interceptSvmMace"] |> round(2),
+                               ")",
+                               sep = ""))
+
+calEstimatesXgbMace <- c(paste("Inclinação: ",
+                               calEstimates["Point estimate", "slopeXgbMace"] |> round(2),
+                               " (",
+                               calEstimates["Lower confidence limit.2.5 %", "slopeXgbMace"] |> round(2),
+                               "-",
+                               calEstimates["Upper confidence limit.97.5 %", "slopeXgbMace"] |> round(2),
+                               ")",
+                               sep = ""),
+                         paste("Intercepto: ",
+                               calEstimates["Point estimate", "interceptXgbMace"] |> round(2),
+                               " (",
+                               calEstimates["Lower confidence limit.2.5 %", "interceptXgbMace"] |> round(2),
+                               "-",
+                               calEstimates["Upper confidence limit.97.5 %", "interceptXgbMace"] |> round(2),
+                               ")",
+                               sep = ""))
+
+calEstimatesLrmBleeding <- c(paste("Inclinação: ",
+                               calEstimates["Point estimate", "slopeLrmBleeding"] |> round(2),
+                               " (",
+                               calEstimates["Lower confidence limit.2.5 %", "slopeLrmBleeding"] |> round(2),
+                               "-",
+                               calEstimates["Upper confidence limit.97.5 %", "slopeLrmBleeding"] |> round(2),
+                               ")",
+                               sep = ""),
+                         paste("Intercepto: ",
+                               calEstimates["Point estimate", "interceptLrmBleeding"] |> round(2),
+                               " (",
+                               calEstimates["Lower confidence limit.2.5 %", "interceptLrmBleeding"] |> round(2),
+                               "-",
+                               calEstimates["Upper confidence limit.97.5 %", "interceptLrmBleeding"] |> round(2),
+                               ")",
+                               sep = ""))
+
+calEstimatesSvmBleeding <- c(paste("Inclinação: ",
+                               calEstimates["Point estimate", "slopeSvmBleeding"] |> round(2),
+                               " (",
+                               calEstimates["Lower confidence limit.2.5 %", "slopeSvmBleeding"] |> round(2),
+                               "-",
+                               calEstimates["Upper confidence limit.97.5 %", "slopeSvmBleeding"] |> round(2),
+                               ")",
+                               sep = ""),
+                         paste("Intercepto: ",
+                               calEstimates["Point estimate", "interceptSvmBleeding"] |> round(2),
+                               " (",
+                               calEstimates["Lower confidence limit.2.5 %", "interceptSvmBleeding"] |> round(2),
+                               "-",
+                               calEstimates["Upper confidence limit.97.5 %", "interceptSvmBleeding"] |> round(2),
+                               ")",
+                               sep = ""))
+
+calEstimatesXgbBleeding <- c(paste("Inclinação: ",
+                               calEstimates["Point estimate", "slopeXgbBleeding"] |> round(2),
+                               " (",
+                               calEstimates["Lower confidence limit.2.5 %", "slopeXgbBleeding"] |> round(2),
+                               "-",
+                               calEstimates["Upper confidence limit.97.5 %", "slopeXgbBleeding"] |> round(2),
+                               ")",
+                               sep = ""),
+                         paste("Intercepto: ",
+                               calEstimates["Point estimate", "interceptXgbBleeding"] |> round(2),
+                               " (",
+                               calEstimates["Lower confidence limit.2.5 %", "interceptXgbBleeding"] |> round(2),
+                               "-",
+                               calEstimates["Upper confidence limit.97.5 %", "interceptXgbBleeding"] |> round(2),
+                               ")",
+                               sep = ""))
+
+# Calibration curve: lrm for mace
+ggplot(predictions,
+       aes(y = mace,
+           x = lrmMace)) +
+  geom_abline(linetype = "dashed",
+              alpha = 0.5,
+              size = 0.5) +
+  geom_smooth(method = "lm",
+              aes(color = "Calibração logística"),
+              se = FALSE) +
+  geom_smooth(method = "loess",
+              aes(color = "Calibração flexível (Loess)"),
+              fill = "lightgray") +
+  geom_point(alpha = 0.2) +
+  scale_color_manual(name = "",
+                     breaks = c("Calibração logística",
+                                "Calibração flexível (Loess)"), 
+                     values = c("#850a70", "#009fc3")) +
+  guides(color=guide_legend(override.aes=list(fill=NA))) +
+  scale_y_continuous(labels = scales::label_percent(suffix = ""),
+                     expand = expansion(0,0),
+                     limits = c(-0.15, 1.3),
+                     breaks = seq(0, 1, by = 0.2)) +
+  scale_x_continuous(labels = scales::label_percent(suffix = ""),
+                     expand = expansion(0.01,0)) +
+  labs(x = "\nRisco Predito (%)",
+       y = "Probabilidade Observada (%)\n",
+       subtitle = "Regressão para Eventos Cardiovasculares\n") +
+  annotate("text",
+           x = 0.1,
+           y = 0.7,
+           label = paste(calEstimatesLrmMace[[1]],
+                         calEstimatesLrmMace[[2]],
+                         sep = "\n"),
+           size = 3,
+           family = "Montserrat") +
+  theme_bw() +
+  theme(panel.border = element_blank(),
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(),
+        axis.ticks.length = unit(7.5, "pt"),
+        axis.title = element_text(size = 12,
+                                  family = "Montserrat"),
+        axis.text = element_text(size = 10,
+                                 family = "Montserrat",
+                                 color = "black"),
+        legend.position = c(0.5, 0.95),
+        legend.direction = "horizontal",
+        legend.box.just = "center",
+        legend.margin = margin(2, 2, 2, 2),
+        legend.text = element_text(size = 10,
+                                   color = "black",
+                                   family = "Montserrat"),
+        plot.subtitle = element_text(size = 12,
+                                    hjust = 0.5,
+                                    color = "black",
+                                    family = "Montserrat",
+                                    face = "bold"))
+
+# Calibration curve: svm for mace
+ggplot(predictions,
+       aes(y = mace,
+           x = svmMace)) +
+  geom_abline(linetype = "dashed",
+              alpha = 0.5,
+              size = 0.5) +
+  geom_smooth(method = "lm",
+              aes(color = "Calibração logística"),
+              se = FALSE) +
+  geom_smooth(method = "loess",
+              aes(color = "Calibração flexível (Loess)"),
+              fill = "lightgray") +
+  geom_point(alpha = 0.2) +
+  scale_color_manual(name = "",
+                     breaks = c("Calibração logística",
+                                "Calibração flexível (Loess)"), 
+                     values = c("#850a70", "#009fc3")) +
+  guides(color=guide_legend(override.aes=list(fill=NA))) +
+  scale_y_continuous(labels = scales::label_percent(suffix = ""),
+                     expand = expansion(0,0),
+                     limits = c(-0.3, 1.3),
+                     breaks = seq(0, 1, by = 0.2)) +
+  scale_x_continuous(labels = scales::label_percent(suffix = ""),
+                     expand = expansion(0.01,0)) +
+  labs(x = "\nRisco Predito (%)",
+       y = "Probabilidade Observada (%)\n",
+       subtitle = "SVM para Eventos Cardiovasculares\n") +
+  annotate("text",
+           x = 0.125,
+           y = 0.7,
+           label = paste(calEstimatesLrmMace[[1]],
+                         calEstimatesLrmMace[[2]],
+                         sep = "\n"),
+           size = 3,
+           family = "Montserrat") +
+  theme_bw() +
+  theme(panel.border = element_blank(),
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(),
+        axis.ticks.length = unit(7.5, "pt"),
+        axis.title = element_text(size = 12,
+                                  family = "Montserrat"),
+        axis.text = element_text(size = 10,
+                                 family = "Montserrat",
+                                 color = "black"),
+        legend.position = c(0.5, 0.95),
+        legend.direction = "horizontal",
+        legend.box.just = "center",
+        legend.margin = margin(2, 2, 2, 2),
+        legend.text = element_text(size = 10,
+                                   color = "black",
+                                   family = "Montserrat"),
+        plot.subtitle = element_text(size = 12,
+                                    hjust = 0.5,
+                                    color = "black",
+                                    family = "Montserrat",
+                                    face = "bold"))
+
+# Calibration curve: xgb for mace
+ggplot(predictions,
+       aes(y = mace,
+           x = xgbMace)) +
+  geom_abline(linetype = "dashed",
+              alpha = 0.5,
+              size = 0.5) +
+  geom_smooth(method = "lm",
+              aes(color = "Calibração logística"),
+              se = FALSE) +
+  geom_smooth(method = "loess",
+              aes(color = "Calibração flexível (Loess)"),
+              fill = "lightgray") +
+  geom_point(alpha = 0.2) +
+  scale_color_manual(name = "",
+                     breaks = c("Calibração logística",
+                                "Calibração flexível (Loess)"), 
+                     values = c("#850a70", "#009fc3")) +
+  guides(color=guide_legend(override.aes=list(fill=NA))) +
+  scale_y_continuous(labels = scales::label_percent(suffix = ""),
+                     expand = expansion(0,0),
+                     limits = c(-0.15, 1.3),
+                     breaks = seq(0, 1, by = 0.2)) +
+  scale_x_continuous(labels = scales::label_percent(suffix = ""),
+                     expand = expansion(0.01,0)) +
+  labs(x = "\nRisco Predito (%)",
+       y = "Probabilidade Observada (%)\n",
+       subtitle = "XGB para Eventos Cardiovasculares\n") +
+  annotate("text",
+           x = 0.15,
+           y = 0.7,
+           label = paste(calEstimatesLrmMace[[1]],
+                         calEstimatesLrmMace[[2]],
+                         sep = "\n"),
+           size = 3,
+           family = "Montserrat") +
+  theme_bw() +
+  theme(panel.border = element_blank(),
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(),
+        axis.ticks.length = unit(7.5, "pt"),
+        axis.title = element_text(size = 12,
+                                  family = "Montserrat"),
+        axis.text = element_text(size = 10,
+                                 family = "Montserrat",
+                                 color = "black"),
+        legend.position = c(0.5, 0.95),
+        legend.direction = "horizontal",
+        legend.box.just = "center",
+        legend.margin = margin(2, 2, 2, 2),
+        legend.text = element_text(size = 10,
+                                   color = "black",
+                                   family = "Montserrat"),
+        plot.subtitle = element_text(size = 12,
+                                    hjust = 0.5,
+                                    color = "black",
+                                    family = "Montserrat",
+                                    face = "bold"))
+
+# Calibration curve: lrm for bleeding
+ggplot(predictions,
+       aes(y = bleeding,
+           x = lrmBleeding)) +
+  geom_abline(linetype = "dashed",
+              alpha = 0.5,
+              size = 0.5) +
+  geom_smooth(method = "lm",
+              aes(color = "Calibração logística"),
+              se = FALSE) +
+  geom_smooth(method = "loess",
+              aes(color = "Calibração flexível (Loess)"),
+              fill = "lightgray") +
+  geom_point(alpha = 0.2) +
+  scale_color_manual(name = "",
+                     breaks = c("Calibração logística",
+                                "Calibração flexível (Loess)"), 
+                     values = c("#850a70", "#009fc3")) +
+  guides(color=guide_legend(override.aes=list(fill=NA))) +
+  scale_y_continuous(labels = scales::label_percent(suffix = ""),
+                     expand = expansion(0,0),
+                     limits = c(-0.15, 1.3),
+                     breaks = seq(0, 1, by = 0.2)) +
+  scale_x_continuous(labels = scales::label_percent(suffix = ""),
+                     expand = expansion(0.01,0)) +
+  labs(x = "\nRisco Predito (%)",
+       y = "Probabilidade Observada (%)\n",
+       subtitle = "Regressão para Sangramento Grave\n") +
+  annotate("text",
+           x = 0.07,
+           y = 0.7,
+           label = paste(calEstimatesLrmBleeding[[1]],
+                         calEstimatesLrmBleeding[[2]],
+                         sep = "\n"),
+           size = 3,
+           family = "Montserrat") +
+  theme_bw() +
+  theme(panel.border = element_blank(),
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(),
+        axis.ticks.length = unit(7.5, "pt"),
+        axis.title = element_text(size = 12,
+                                  family = "Montserrat"),
+        axis.text = element_text(size = 10,
+                                 family = "Montserrat",
+                                 color = "black"),
+        legend.position = c(0.5, 0.95),
+        legend.direction = "horizontal",
+        legend.box.just = "center",
+        legend.margin = margin(2, 2, 2, 2),
+        legend.text = element_text(size = 10,
+                                   color = "black",
+                                   family = "Montserrat"),
+        plot.subtitle = element_text(size = 12,
+                                    hjust = 0.5,
+                                    color = "black",
+                                    family = "Montserrat",
+                                    face = "bold"))
+
+# Calibration curve: svm for bleeding
+ggplot(predictions,
+       aes(y = bleeding,
+           x = svmBleeding)) +
+  geom_abline(linetype = "dashed",
+              alpha = 0.5,
+              size = 0.5) +
+  geom_smooth(method = "lm",
+              aes(color = "Calibração logística"),
+              se = FALSE) +
+  geom_smooth(method = "loess",
+              aes(color = "Calibração flexível (Loess)"),
+              fill = "lightgray") +
+  geom_point(alpha = 0.2) +
+  scale_color_manual(name = "",
+                     breaks = c("Calibração logística",
+                                "Calibração flexível (Loess)"), 
+                     values = c("#850a70", "#009fc3")) +
+  guides(color=guide_legend(override.aes=list(fill=NA))) +
+  scale_y_continuous(labels = scales::label_percent(suffix = ""),
+                     expand = expansion(0,0),
+                     limits = c(-0.3, 1.3),
+                     breaks = seq(0, 1, by = 0.2)) +
+  scale_x_continuous(labels = scales::label_percent(suffix = ""),
+                     expand = expansion(0.01,0)) +
+  labs(x = "\nRisco Predito (%)",
+       y = "Probabilidade Observada (%)\n",
+       subtitle = "SVM para Sangramento Grave\n") +
+  annotate("text",
+           x = 0.06,
+           y = 0.7,
+           label = paste(calEstimatesLrmBleeding[[1]],
+                         calEstimatesLrmBleeding[[2]],
+                         sep = "\n"),
+           size = 3,
+           family = "Montserrat") +
+  theme_bw() +
+  theme(panel.border = element_blank(),
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(),
+        axis.ticks.length = unit(7.5, "pt"),
+        axis.title = element_text(size = 12,
+                                  family = "Montserrat"),
+        axis.text = element_text(size = 10,
+                                 family = "Montserrat",
+                                 color = "black"),
+        legend.position = c(0.5, 0.95),
+        legend.direction = "horizontal",
+        legend.box.just = "center",
+        legend.margin = margin(2, 2, 2, 2),
+        legend.text = element_text(size = 10,
+                                   color = "black",
+                                   family = "Montserrat"),
+        plot.subtitle = element_text(size = 12,
+                                    hjust = 0.5,
+                                    color = "black",
+                                    family = "Montserrat",
+                                    face = "bold"))
+
+# Calibration curve: xgb for bleeding
+ggplot(predictions,
+       aes(y = bleeding,
+           x = xgbBleeding)) +
+  geom_abline(linetype = "dashed",
+              alpha = 0.5,
+              size = 0.5) +
+  geom_smooth(method = "lm",
+              aes(color = "Calibração logística"),
+              se = FALSE) +
+  geom_smooth(method = "loess",
+              aes(color = "Calibração flexível (Loess)"),
+              fill = "lightgray") +
+  geom_point(alpha = 0.2) +
+  scale_color_manual(name = "",
+                     breaks = c("Calibração logística",
+                                "Calibração flexível (Loess)"), 
+                     values = c("#850a70", "#009fc3")) +
+  guides(color=guide_legend(override.aes=list(fill=NA))) +
+  scale_y_continuous(labels = scales::label_percent(suffix = ""),
+                     expand = expansion(0,0),
+                     limits = c(-0.7, 1.3),
+                     breaks = seq(0, 1, by = 0.2)) +
+  scale_x_continuous(labels = scales::label_percent(suffix = ""),
+                     expand = expansion(0.01,0)) +
+  labs(x = "\nRisco Predito (%)",
+       y = "Probabilidade Observada (%)\n",
+       subtitle = "XGB para Sangramento Grave\n") +
+  annotate("text",
+           x = 0.15,
+           y = 0.8,
+           label = paste(calEstimatesLrmBleeding[[1]],
+                         calEstimatesLrmBleeding[[2]],
+                         sep = "\n"),
+           size = 3,
+           family = "Montserrat") +
+  theme_bw() +
+  theme(panel.border = element_blank(),
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(),
+        axis.ticks.length = unit(7.5, "pt"),
+        axis.title = element_text(size = 12,
+                                  family = "Montserrat"),
+        axis.text = element_text(size = 10,
+                                 family = "Montserrat",
+                                 color = "black"),
+        legend.position = c(0.5, 0.95),
+        legend.direction = "horizontal",
+        legend.box.just = "center",
+        legend.margin = margin(2, 2, 2, 2),
+        legend.text = element_text(size = 10,
+                                   color = "black",
+                                   family = "Montserrat"),
+        plot.subtitle = element_text(size = 12,
+                                    hjust = 0.5,
+                                    color = "black",
+                                    family = "Montserrat",
+                                    face = "bold"))
+```
+
+Performance estimates of predictions.
+```{r, warning=FALSE}
+
+# Packages
+library(pROC)
+library(mice)
+library(rms)
+library(tidyverse)
+
+# Data
+load("imputation/test.rda")
+load("models/predictionLrmMace.rda")
+load("models/predictionSvmMace.rda")
+load("models/predictionXgbMace.rda")
+load("models/predictionLrmBleeding.rda")
+load("models/predictionSvmBleeding.rda")
+load("models/predictionXgbBleeding.rda")
+
+predictions <- data.frame(mace = complete(impTest, 1)[["mace"]],
+                              lrmMace = predictionLrmMace,
+                              svmMace = predictionSvmMace[[2]],
+                              xgbMace = predictionXgbMace[[2]],
+                          bleeding = complete(impTest, 1)[["mace"]],
+                              lrmBleeding = predictionLrmBleeding,
+                              svmBleeding = predictionSvmBleeding[[2]],
+                              xgbBleeding = predictionXgbBleeding[[2]])
+
+# ROC objects
+rocLrmMace <- roc(predictions$mace, predictions$lrmMace)
+rocSvmMace <- roc(predictions$mace, predictions$svmMace)
+rocXgbMace <- roc(predictions$mace, predictions$xgbMace)
+
+rocLrmBleeding <- roc(predictions$bleeding, predictions$lrmBleeding)
+rocSvmBleeding <- roc(predictions$bleeding, predictions$svmBleeding)
+rocXgbBleeding <- roc(predictions$bleeding, predictions$xgbBleeding)
+
+# Ṕerformance measures
+rocLrmMace |> 
+  coords(x = "best", best.method="youden", ret = "all", transpose = TRUE) |> 
+  round(2)
+rocSvmMace |> 
+  coords(x = "best", best.method="youden", ret = "all", transpose = TRUE) |> 
+  round(2)
+rocXgbMace |> 
+  coords(x = "best", best.method="youden", ret = "all", transpose = TRUE) |> 
+  round(2)
+rocLrmBleeding |> 
+  coords(x = "best", best.method="youden", ret = "all", transpose = TRUE) |> 
+  round(2)
+rocSvmBleeding |> 
+  coords(x = "best", best.method="youden", ret = "all", transpose = TRUE) |> 
+  round(2)
+rocXgbBleeding |> 
+  coords(x = "best", best.method="youden", ret = "all", transpose = TRUE) |> 
+  round(2)
+
+```
+
+
+Comparison of risk classes per outcome.
+
+```{r, warning=FALSE}
+
+library(mice)
+library(tidyverse)
+library(rms)
+
+# Data from all patients
+load("imputation/train.rda")
+load("imputation/test.rda")
+
+impAcs <- rbind(complete(impTrain, 1),
+          complete(impTest, 1))
+
+# Predict outcomes using lrm
+load("models/lrmMace.rda")
+load("models/lrmBleeding.rda")
+
+riskMace <- predict(lrmMace,
+                    newdata = impAcs,
+                    type = "fitted")
+
+riskBleeding <- predict(lrmBleeding,
+                        newdata = impAcs,
+                        type = "fitted")
+
+# Dataframe with actual outcomes and predicted risk
+dfRisk <- data.frame(mace = impAcs$mace,
+                     riskMace = riskMace,
+                     bleeeding = impAcs$majorBleeding,
+                     riskBleeding = riskBleeding,
+                     tercileMace = ntile(riskMace, 3),
+                     tercileBleeding = ntile(riskBleeding, 3),
+                     centileMace = ntile(riskMace, 100),
+                     centileBleeding = ntile(riskBleeding, 100))
+
+# Cross classification of risk classes for each outcome
+quantile(dfRisk$riskMace, probs = c(1/3, 2/3)) |> round(3)
+quantile(dfRisk$riskBleeding, probs = c(1/3, 2/3)) |> round(3)
+
+nTercile <- floor(nrow(impAcs) / 3)
+
+crossRisk <- dfRisk |> 
+  group_by(tercileMace,
+           tercileBleeding) |> 
+  summarise(n = n(),
+         percent = n / nTercile * 100,
+         percent = ifelse(percent < 1, "", paste(as.character(round(percent)),
+                                                 "%",
+                                                 sep = "")))
+
+ggplot(crossRisk,
+       aes(y = n,
+           x = factor(tercileMace,
+                      levels = seq(1, 3, by = 1),
+                      labels = c(paste("Baixo risco\ncardiovascular\n", "(n = ", nTercile, ")", sep = ""),
+                                 paste("Intermediário risco\ncardiovascular\n", "(n = ", nTercile, ")", sep = ""),
+                                     paste("Alto risco\ncardiovascular\n", "(n = ", nTercile, ")", sep = ""))),
+               fill = factor(tercileBleeding,
+                          levels = seq(3, 1, by = -1),
+                          labels = c(paste("Alto risco\nhemorrágico\n", "(n = ", nTercile, ")", sep = ""), 
+                                     paste("Intermediário risco\nhemorrágico\n", "(n = ", nTercile, ")", sep = ""), 
+                                     paste("Baixo risco\nhemorrágico\n", "(n = ", nTercile, ")", sep = ""))),
+               label = percent)) +
+  geom_col() +
+  scale_fill_manual(name = "",
+                      labels = c(paste("Alto risco\nhemorrágico\n", "(n = ", nTercile, ")", sep = ""), 
+                                     paste("Intermediário risco\nhemorrágico\n", "(n = ", nTercile, ")", sep = ""), 
+                                     paste("Baixo risco\nhemorrágico\n", "(n = ", nTercile, ")", sep = "")),
+                      values = c("#5BBAD7", "#8CCFE3", "#BDE3EF")) +
+  geom_text(size = 4, 
+            position = position_stack(vjust = 0.5),
+            family = "Montserrat") +
+  labs(x = "",
+       y = "Número de Pacientes\n") +
+  theme_bw() +
+  theme(panel.border = element_blank(),
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(),
+        axis.ticks.length = unit(7.5, "pt"),
+        axis.title = element_text(size = 12,
+                                  family = "Montserrat"),
+        axis.text = element_text(size = 10,
+                                 family = "Montserrat",
+                                 color = "black"),
+        legend.position = "top",
+        legend.direction = "horizontal",
+        legend.spacing.x = unit(0.4, "cm"),
+        legend.text = element_text(size = 10,
+                                   color = "black",
+                                   family = "Montserrat"),
+        plot.subtitle = element_text(size = 12,
+                                    hjust = 0.5,
+                                    color = "black",
+                                    family = "Montserrat",
+                                    face = "bold"))
+
+# Risk differece per centile of mace risk
+quantile(dfRisk$riskMace, probs = seq(1, 9, by = 1)/10) |> round(3)
+
+riskTradeoffMace <- dfRisk |> 
+  group_by(centileMace,
+           tercileBleeding) |> 
+  summarise(riskMace = mean(riskMace) * 100,
+            riskBleeding = mean(riskBleeding * 100),
+            riskDiff = riskMace - riskBleeding) |> 
+  ungroup()
+
+ggplot(riskTradeoffMace,
+       aes(x = centileMace,
+           y = riskDiff,
+           color = factor(tercileBleeding,
+                          levels = seq(3, 1, by = -1),
+                          labels = c("Alto risco hemorrágico", 
+                                     "Intermediário risco hemorrágico", 
+                                     "Baixo risco hemorrágico")))) +
+  geom_hline(alpha = 0.3,
+             yintercept = 0,
+             linetype = "dashed") +
+  geom_smooth(alpha = 0.3,
+              fill = "lightgrey") +
+  geom_point(alpha = 0.7) +
+  scale_color_manual(name = "",
+                    labels = c("Alto risco hemorrágico",
+                               "Intermediário risco hemorrágico",
+                               "Baixo risco hemorrágico"),
+                    values = c("#4C0640", "#850A70", "#BE0EA0")) +
+  guides(color=guide_legend(override.aes=list(fill=NA))) +
+  labs(x = "\nPercentis de Risco Cardiovascular",
+       y = "Diferença Absoluta entre Riscos de Eventos\nCardiovasculares e Hemorrágicos (%)\n") +
+  scale_x_continuous(expand = expansion(0.05,0)) +
+  scale_y_continuous(expand = expansion(0.05,0)) +
+  theme_bw() +
+  theme(panel.border = element_blank(),
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(),
+        axis.ticks.length = unit(7.5, "pt"),
+        axis.title = element_text(size = 12,
+                                  family = "Montserrat"),
+        axis.text = element_text(size = 10,
+                                 family = "Montserrat",
+                                 color = "black"),
+        legend.position = c(0.3, 0.8),
+        legend.direction = "vertical",
+        legend.box.just = "center",
+        legend.margin = margin(2, 2, 2, 2),
+        legend.text = element_text(size = 11,
+                                   color = "black",
+                                   family = "Montserrat"))
+  
+# Risk difference per centile of bleeding risk
+quantile(dfRisk$riskBleeding, probs = seq(1, 9, by = 1)/10) |> round(3)
+
+riskTradeoffBleeding <- dfRisk |> 
+  group_by(centileBleeding,
+           tercileMace) |> 
+  summarise(riskMace = mean(riskMace) * 100,
+            riskBleeding = mean(riskBleeding * 100),
+            riskDiff = riskMace - riskBleeding) |> 
+  ungroup()
+
+ggplot(riskTradeoffBleeding,
+       aes(x = centileBleeding,
+           y = riskDiff,
+           color = factor(tercileMace,
+                          levels = seq(3, 1, by = -1),
+                          labels = c("Alto risco cardiovascular", 
+                                     "Intermediário risco cardiovascular", 
+                                     "Baixo risco cardiovascular")))) +
+  geom_hline(alpha = 0.3,
+             yintercept = 0,
+             linetype = "dashed") +
+  geom_smooth(alpha = 0.3,
+              fill = "lightgrey") +
+  geom_point(alpha = 0.7) +
+  scale_color_manual(name = "",
+                    labels = c("Alto risco cardiovascular",
+                               "Intermediário risco cardiovascular",
+                               "Baixo risco cardiovascular"),
+                    values = c("#185462", "#257F93", "#31A9C4")) +
+  guides(color=guide_legend(override.aes=list(fill=NA))) +
+  labs(x = "\nPercentis de Risco Hemorrágico",
+       y = "Diferença Absoluta entre Riscos de Eventos\nCardiovasculares e Hemorrágicos (%)\n") +
+  scale_x_continuous(expand = expansion(0.05,0)) +
+  scale_y_continuous(expand = expansion(0.05,0)) +
+  theme_bw() +
+  theme(panel.border = element_blank(),
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(),
+        axis.ticks.length = unit(7.5, "pt"),
+        axis.title = element_text(size = 12,
+                                  family = "Montserrat"),
+        axis.text = element_text(size = 10,
+                                 family = "Montserrat",
+                                 color = "black"),
+        legend.position = c(0.3, 0.15),
+        legend.direction = "vertical",
+        legend.box.just = "center",
+        legend.margin = margin(2, 2, 2, 2),
+        legend.text = element_text(size = 11,
+                                   color = "black",
+                                   family = "Montserrat"))
+```
+
+Decision curve analysis.
+
+```{r, warning=FALSE}
+
+library(dcurves)
+library(mice)
+library(rms)
+library(tidyverse)
+
+# Data from all patients
+load("imputation/train.rda")
+load("imputation/test.rda")
+
+impAcs <- rbind(complete(impTrain, 1),
+          complete(impTest, 1))
+
+# Risk predictions
+load("models/lrmMace.rda")
+load("models/svmMace.rda")
+load("models/xgbMace.rda")
+load("models/lrmBleeding.rda")
+load("models/svmBleeding.rda")
+load("models/xgbBleeding.rda")
+
+riskLrmMace <-  predict(lrmMace,
+                        newdata = impAcs,
+                        type = "fitted")
+riskSvmMace <- predict(svmMace,
+                       newdata = impAcs,
+                       type = "prob")[[2]]
+riskXgbMace <- predict(xgbMace,
+                       newdata = impAcs,
+                       type = "prob")[[2]]
+riskLrmBleeding <-  predict(lrmBleeding,
+                        newdata = impAcs,
+                        type = "fitted")
+riskSvmBleeding <- predict(svmBleeding,
+                       newdata = impAcs,
+                       type = "prob")[[2]]
+riskXgbBleeding <- predict(xgbBleeding,
+                       newdata = impAcs,
+                       type = "prob")[[2]]
+
+riskPredictions <- data.frame(mace = impAcs$mace,
+                              bleeding = impAcs$majorBleeding,
+                              riskLrmMace,
+                              riskSvmMace,
+                              riskXgbMace,
+                              riskLrmBleeding,
+                              riskSvmBleeding,
+                              riskXgbBleeding)
+
+# DCA for MACE
+dca(formula = mace ~ riskLrmMace + riskSvmMace + riskXgbMace,
+    data = riskPredictions) |> 
+  plot(smooth = TRUE) +
+  labs(x = "\nProbabilidade Limiar (%)",
+       y = "Benefício Líquido (%)\n",
+       title = "Curvas de Decisão para Eventos Cardiovasculares\n") +
+   scale_color_manual(labels = c("Tratar todos", 
+                                 "Tratar ninguém",
+                                 "Regressão",
+                                 "SVM",
+                                 "XGB"), 
+                      values = c("#235789",
+                                 "#A4B0F5",
+                                 "#8FC93A",
+                                 "#E6AF2E",
+                                 "#E18335")) +
+  scale_x_continuous(expand = expansion(0,0.007),
+                     limits = c(0,1),
+                     labels = scales::label_percent(suffix = "")) +
+  scale_y_continuous(expand = expansion(0,0),
+                     labels = scales::label_percent(suffix = "")) +
+  theme_bw() +
+  theme(panel.border = element_blank(),
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(),
+        axis.ticks.length = unit(7.5, "pt"),
+        axis.title = element_text(size = 12,
+                                  family = "Montserrat"),
+        axis.text = element_text(size = 10,
+                                 family = "Montserrat",
+                                 color = "black"),
+        legend.position = c(0.75, 0.7),
+        legend.direction = "vertical",
+        legend.box.just = "center",
+        legend.margin = margin(2, 2, 2, 2),
+        legend.text = element_text(size = 11,
+                                   color = "black",
+                                   family = "Montserrat"),
+        plot.title = element_text(size = 12.5,
+                                    hjust = 0.5,
+                                    color = "black",
+                                    family = "Montserrat",
+                                    face = "bold"))
+
+# Net interventions avoided for MACE
+dca(formula = mace ~ riskLrmMace + riskSvmMace + riskXgbMace,
+    data = riskPredictions) |> 
+  net_intervention_avoided() |> 
+  plot(smooth = TRUE) +
+  labs(x = "\nProbabilidade Limiar (%)",
+       y = "Redução Líquida nas Intervenções\na cada 100 pacientes\n",
+       title = "Intervenções para Eventos Cardiovasculares Evitadas\n") +
+   scale_color_manual(labels = c("Regressão",
+                                 "SVM",
+                                 "XGB"), 
+                      values = c("#A4B0F5",
+                                 "#8FC93A",
+                                 "#E6AF2E")) +
+  scale_x_continuous(expand = expansion(0,0.007),
+                     limits = c(0,1),
+                     labels = scales::label_percent(suffix = "")) +
+  scale_y_continuous(expand = expansion(0,0)) +
+  theme_bw() +
+  theme(panel.border = element_blank(),
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(),
+        axis.ticks.length = unit(7.5, "pt"),
+        axis.title = element_text(size = 12,
+                                  family = "Montserrat"),
+        axis.text = element_text(size = 10,
+                                 family = "Montserrat",
+                                 color = "black"),
+        legend.position = c(0.7, 0.6),
+        legend.direction = "vertical",
+        legend.box.just = "center",
+        legend.margin = margin(2, 2, 2, 2),
+        legend.text = element_text(size = 11,
+                                   color = "black",
+                                   family = "Montserrat"),
+        plot.title = element_text(size = 12.5,
+                                    hjust = 0.5,
+                                    color = "black",
+                                    family = "Montserrat",
+                                    face = "bold"))
+
+# Clinical consequences for MACE
+test_consequences(formula = mace ~ riskLrmMace + riskSvmMace + riskXgbMace,
+    data = riskPredictions)
+
+# DCA for major bleeding
+dca(formula = bleeding ~ riskLrmBleeding + riskSvmBleeding + riskXgbBleeding,
+    data = riskPredictions) |> 
+  plot(smooth = TRUE) +
+  labs(x = "\nProbabilidade Limiar (%)",
+       y = "Benefício Líquido (%)\n",
+       title = "Curvas de Decisão para Sangramento Grave\n") +
+   scale_color_manual(labels = c("Tratar todos", 
+                                 "Tratar ninguém",
+                                 "Regressão",
+                                 "SVM",
+                                 "XGB"), 
+                      values = c("#235789",
+                                 "#A4B0F5",
+                                 "#8FC93A",
+                                 "#E6AF2E",
+                                 "#E18335")) +
+  scale_x_continuous(expand = expansion(0,0.007),
+                     limits = c(0,1),
+                     labels = scales::label_percent(suffix = "")) +
+  scale_y_continuous(expand = expansion(0,0),
+                     labels = scales::label_percent(suffix = "")) +
+  theme_bw() +
+  theme(panel.border = element_blank(),
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(),
+        axis.ticks.length = unit(7.5, "pt"),
+        axis.title = element_text(size = 12,
+                                  family = "Montserrat"),
+        axis.text = element_text(size = 10,
+                                 family = "Montserrat",
+                                 color = "black"),
+        legend.position = c(0.6, 0.5),
+        legend.direction = "vertical",
+        legend.box.just = "center",
+        legend.margin = margin(2, 2, 2, 2),
+        legend.text = element_text(size = 11,
+                                   color = "black",
+                                   family = "Montserrat"),
+        plot.title = element_text(size = 12.5,
+                                    hjust = 0.5,
+                                    color = "black",
+                                    family = "Montserrat",
+                                    face = "bold"))
+
+# Net interventions avoided for major bleeding
+dca(formula = bleeding ~ riskLrmBleeding + riskSvmBleeding + riskXgbBleeding,
+    data = riskPredictions) |> 
+  net_intervention_avoided() |> 
+  plot(smooth = TRUE) +
+  labs(x = "\nProbabilidade Limiar (%)",
+       y = "Redução Líquida nas Intervenções\na cada 100 pacientes\n",
+       title = "Intervenções para Sangramento Grave Evitadas\n") +
+   scale_color_manual(labels = c("Regressão",
+                                 "SVM",
+                                 "XGB"), 
+                      values = c("#A4B0F5",
+                                 "#8FC93A",
+                                 "#E6AF2E")) +
+  scale_x_continuous(expand = expansion(0,0.007),
+                     limits = c(0,1),
+                     labels = scales::label_percent(suffix = "")) +
+  scale_y_continuous(expand = expansion(0,0)) +
+  theme_bw() +
+  theme(panel.border = element_blank(),
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line = element_line(),
+        axis.ticks.length = unit(7.5, "pt"),
+        axis.title = element_text(size = 12,
+                                  family = "Montserrat"),
+        axis.text = element_text(size = 10,
+                                 family = "Montserrat",
+                                 color = "black"),
+        legend.position = c(0.7, 0.6),
+        legend.direction = "vertical",
+        legend.box.just = "center",
+        legend.margin = margin(2, 2, 2, 2),
+        legend.text = element_text(size = 11,
+                                   color = "black",
+                                   family = "Montserrat"),
+        plot.title = element_text(size = 12.5,
+                                    hjust = 0.5,
+                                    color = "black",
+                                    family = "Montserrat",
+                                    face = "bold"))
+
+# Clinical consequences for major bleeding
+test_consequences(formula = bleeding ~ riskLrmBleeding + riskSvmBleeding + riskXgbBleeding,
+    data = riskPredictions)
+
+```
+
+
