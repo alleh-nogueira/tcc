@@ -1,0 +1,87 @@
+Call:
+roc.default(response = predictions$mace, predictor = predictions$lrmMace)
+
+Data: predictions$lrmMace in 243 controls (predictions$mace 0) < 14 cases (predictions$mace 1).
+Area under the curve: 0.7546
+95% CI: 0.6385-0.8706 (DeLong)
+
+Call:
+roc.default(response = predictions$mace, predictor = predictions$svmMace)
+
+Data: predictions$svmMace in 243 controls (predictions$mace 0) < 14 cases (predictions$mace 1).
+Area under the curve: 0.6881
+95% CI: 0.5323-0.8439 (DeLong)
+
+Call:
+roc.default(response = predictions$mace, predictor = predictions$xgbMace)
+
+Data: predictions$xgbMace in 243 controls (predictions$mace 0) < 14 cases (predictions$mace 1).
+Area under the curve: 0.647
+95% CI: 0.4708-0.8231 (DeLong)
+
+Call:
+roc.default(response = predictions$bleeding, predictor = predictions$lrmBleeding)
+
+Data: predictions$lrmBleeding in 243 controls (predictions$bleeding 0) < 14 cases (predictions$bleeding 1).
+Area under the curve: 0.7688
+95% CI: 0.6103-0.9273 (DeLong)
+
+Call:
+roc.default(response = predictions$bleeding, predictor = predictions$svmBleeding)
+
+Data: predictions$svmBleeding in 243 controls (predictions$bleeding 0) < 14 cases (predictions$bleeding 1).
+Area under the curve: 0.5658
+95% CI: 0.3773-0.7544 (DeLong)
+
+Call:
+roc.default(response = predictions$bleeding, predictor = predictions$xgbBleeding)
+
+Data: predictions$xgbBleeding in 243 controls (predictions$bleeding 0) < 14 cases (predictions$bleeding 1).
+Area under the curve: 0.672
+95% CI: 0.4853-0.8586 (DeLong)
+
+	DeLong's test for two correlated ROC curves
+
+data:  rocLrmMace and rocSvmMace
+Z = 1.0191, p-value = 0.3082
+alternative hypothesis: true difference in AUC is not equal to 0
+95 percent confidence interval:
+ -0.06133507  0.19419809
+sample estimates:
+AUC of roc1 AUC of roc2 
+  0.7545561   0.6881246 
+
+
+	DeLong's test for two correlated ROC curves
+
+data:  rocLrmMace and rocXgbMace
+Z = 1.7576, p-value = 0.07882
+alternative hypothesis: true difference in AUC is not equal to 0
+95 percent confidence interval:
+ -0.0123869  0.2275544
+sample estimates:
+AUC of roc1 AUC of roc2 
+  0.7545561   0.6469724 
+
+DeLong's test for two correlated ROC curves
+
+data:  rocLrmBleeding and rocSvmBleeding
+Z = 2.1025, p-value = 0.03551
+alternative hypothesis: true difference in AUC is not equal to 0
+95 percent confidence interval:
+ 0.01375889 0.39217879
+sample estimates:
+AUC of roc1 AUC of roc2 
+  0.7688125   0.5658436 
+
+
+	DeLong's test for two correlated ROC curves
+
+data:  rocLrmBleeding and rocXgbBleeding
+Z = 1.4253, p-value = 0.1541
+alternative hypothesis: true difference in AUC is not equal to 0
+95 percent confidence interval:
+ -0.03633494  0.23004452
+sample estimates:
+AUC of roc1 AUC of roc2 
+  0.7688125   0.6719577 
